@@ -2452,6 +2452,9 @@ function makeCtx(mats) {
 
 // src/engine/audio_b/foley.js
 var R = Math.random;
+// пик удара уровня 1 (≈ −10 дБ полной шкалы): самый громкий звук механики — удар рамы — остаётся
+// заметно тише выстрела, мелочь (кнопки, трение) — соответственно тише
+var FOLEY_REF = 0.4;
 var jit = (v, k = 0.1) => v * (1 - k + R() * 2 * k);
 function biquad(d, sr, type, f, q = 0.707) {
   const w = 2 * Math.PI * Math.min(f, sr * 0.45) / sr, cw = Math.cos(w), sw = Math.sin(w), a = sw / (2 * q);
@@ -2505,6 +2508,9 @@ var Track = class {
     this.d = new Float32Array(Math.ceil(sr * sec));
   }
   // Банк резонаторов, возбуждаемых сигналом x (начиная с отсчёта i0).
+  // level — пиковая амплитуда события (×REF): раньше выход рос с длительностью контакта и числом
+  // микроударов (пластик — в 50 раз громче стали, трение — десятки единиц), а буфер затем
+  // резался tanh в «прямоугольник» и нормировался в 0,9 — щелчок звучал как удар рамы, с хрипом.
   resonate(x, i0, body, level, damp = 1) {
     const sr = this.sr, d = this.d, B = BODY[body] || body;
     const tail = Math.ceil(sr * Math.min(0.12, B.tau * 8 * damp));
@@ -2529,7 +2535,9 @@ var Track = class {
         out[i] += y;
       }
     }
-    const k = level / Math.max(1e-6, norm) * 1.6;
+    let pk = 0;
+    for (let i = 0; i < n; i++) pk = Math.max(pk, Math.abs(out[i]));
+    const k = level * FOLEY_REF / Math.max(1e-9, pk);
     for (let i = 0; i < n; i++) d[i0 + i] += out[i] * k;
   }
   // Удар: контакт длительностью tc (с) + шумовой «треск» контакта + корпус.
@@ -2562,7 +2570,8 @@ var Track = class {
     biquad(b, sr, "lp", jit(f * 2.2), 0.7);
     biquad(b, sr, "hp", 45, 0.7);
     const np = Math.round(sr / f * 0.5);
-    for (let i = 0; i < n; i++) this.d[i0 + i] += level * (b[i] * 2.2 + (i < np ? Math.sin(Math.PI * i / np) * 0.5 : 0));
+    const k = level * FOLEY_REF * 1.6;
+    for (let i = 0; i < n; i++) this.d[i0 + i] += k * (b[i] * 2.2 + (i < np ? Math.sin(Math.PI * i / np) * 0.5 : 0));
     return this;
   }
   // Трение: поток микрозацепов через корпус + широкополосное шуршание.
@@ -2583,11 +2592,11 @@ var Track = class {
       }
       hiss[i] = (R() * 2 - 1) * env;
     }
-    this.resonate(x, i0, body, level * 1.1, o.damp ?? 0.8);
+    this.resonate(x, i0, body, level * 0.7, o.damp ?? 0.8);
     biquad(hiss, sr, "bp", o.hissF ?? 3200, 0.6);
     biquad(hiss, sr, "hp", 900, 0.7);
     biquad(hiss, sr, "lp", 6500, 0.7);
-    const h = (o.hiss ?? 0.25) * level;
+    const h = (o.hiss ?? 0.25) * level * FOLEY_REF * 2;
     for (let i = 0; i < n; i++) this.d[i0 + i] += hiss[i] * h;
     return this;
   }
@@ -2603,7 +2612,7 @@ var Track = class {
     const b = new Float32Array(Math.max(0, n));
     for (let i = 0; i < n; i++) b[i] = (R() * 2 - 1) * Math.exp(-i / (sr * 3e-3));
     biquad(b, sr, "bp", jit(1400), 0.8);
-    for (let i = 0; i < n; i++) this.d[i0 + i] += b[i] * level * 0.9;
+    for (let i = 0; i < n; i++) this.d[i0 + i] += b[i] * level * FOLEY_REF * 1.4;
     return this.mass(t + 1e-3, level * 0.5, 120, 0.02);
   }
   // Ткань и снаряжение: шуршание нейлона (полосовой шум с рваной огибающей) и хруст складок.
@@ -2623,20 +2632,19 @@ var Track = class {
     }
     biquad(b, sr, "bp", o.f ?? 2400, 0.55);
     biquad(b, sr, "hp", 700, 0.7);
-    for (let i = 0; i < n; i++) this.d[i0 + i] += b[i] * level;
+    for (let i = 0; i < n; i++) this.d[i0 + i] += b[i] * level * FOLEY_REF * 1.2;
     return this;
   }
   buffer(ctx) {
     const d = this.d, sr = this.sr;
     biquad(d, sr, "hp", 40, 0.7);
-    let pk = 0;
-    for (let i = 0; i < d.length; i++) {
-      d[i] = Math.tanh(d[i] * 1.2) / 1.2;
-      pk = Math.max(pk, Math.abs(d[i]));
-    }
-    const g = pk > 0 ? 0.9 / pk : 1;
+    // уровни событий сохраняются как есть; мягкое колено только выше 0,8 — без клиппинга
     const fade = Math.min(d.length, Math.floor(sr * 0.01));
-    for (let i = 0; i < d.length; i++) d[i] *= g * (i > d.length - fade ? (d.length - i) / fade : 1);
+    for (let i = 0; i < d.length; i++) {
+      const v = d[i], a = Math.abs(v);
+      const s = a < 0.8 ? v : Math.sign(v) * (0.8 + 0.18 * Math.tanh((a - 0.8) / 0.18));
+      d[i] = s * (i > d.length - fade ? (d.length - i) / fade : 1);
+    }
     const b = ctx.createBuffer(1, d.length, sr);
     b.getChannelData(0).set(d);
     return b;
@@ -2788,9 +2796,11 @@ var RECIPES = {
   },
   // Переводчик: подпружиненный фиксатор перескакивает в лунку.
   selector(T2, o) {
+    // у АК длинный штампованный рычаг бьёт по крышке — громкий «клац», у AR/SCAR — короткий щелчок
+    const ak = o.fam === "ak";
     T2.scrape(0, 0.03, 0.18, "small", { rate: 1500, tc: 1e-4, hiss: 0.1 });
-    T2.hit(0.03, 0.6, "small", { tc: 1e-4, click: 0.25 });
-    T2.hit(0.031, 0.3, recv(o), { tc: 2e-4, damp: 0.6 });
+    T2.hit(0.03, ak ? 1 : 0.6, "small", { tc: 1e-4, click: 0.25 });
+    T2.hit(0.031, ak ? 0.75 : 0.3, recv(o), { tc: 2e-4, damp: ak ? 0.9 : 0.6 });
   },
   click(T2) {
     T2.hit(0, 0.5, "small", { tc: 1e-4, click: 0.2 });
@@ -2819,9 +2829,9 @@ var RECIPES = {
   // Гильза о бетон: тонкостенная латунная (стальная) трубка звенит коротко.
   casing(T2, o) {
     const body = o.kind === "steel" ? { ...BODY.magSteel, f0: 1800, f1: 9e3, tau: 0.02, n: 30 } : { ...BODY.brass, f0: 2600, f1: 11e3, tau: 0.03, n: 26, decK: 0.5 };
-    T2.hit(0, 0.6, body, { tc: 8e-5, noise: 8e-4 });
-    T2.hit(0.06 + R() * 0.05, 0.3, body, { tc: 1e-4 });
-    T2.hit(0.15 + R() * 0.08, 0.15, body, { tc: 1e-4 });
+    T2.hit(0, 1.2, body, { tc: 8e-5, noise: 8e-4 });
+    T2.hit(0.06 + R() * 0.05, 0.6, body, { tc: 1e-4 });
+    T2.hit(0.15 + R() * 0.08, 0.3, body, { tc: 1e-4 });
   }
 };
 var LEN = { pouch: 0.48, tug: 0.08, shoulder: 0.22, unshoulder: 0.16, battCells: 0.3, magOut: 0.3, magInsert: 0.16, magIn: 0.16, chargeBack: 0.26, chargeRelease: 0.16, boltCatch: 0.14, magGround: 0.5, dryFire: 0.08, selector: 0.08, click: 0.05, tick: 0.06, cycle: 0.14, casing: 0.36 };
