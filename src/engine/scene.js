@@ -7,6 +7,19 @@ import { RenderPass } from "three/addons/postprocessing/RenderPass.js";
 import { GTAOPass } from "three/addons/postprocessing/GTAOPass.js";
 import { UnrealBloomPass } from "three/addons/postprocessing/UnrealBloomPass.js";
 import { OutputPass } from "three/addons/postprocessing/OutputPass.js";
+// Защита HDR-буфера (half float, предел 65504). Острый GGX-блик от точечного света вспышки на стекле
+// или латуни даёт Inf, вырожденная нормаль — NaN; UnrealBloom разносит такой пиксель по мип-цепочке
+// в чёрный прямоугольник на пол-экрана. Ограничение 16384 после ACES неотличимо от белого.
+var HDR_SAFE = (v, mx = "16384.0") => `${v} = clamp(${v}, 0.0, ${mx}); if (any(isnan(${v}))) ${v} = vec3(0.0);`;
+// вариант для RawShaderMaterial на GLSL ES 1.0 (нет isnan): NaN не равен сам себе
+var HDR_SAFE1 = (v) => `${v} = clamp(${v}, 0.0, 16384.0); if (!(${v}.r == ${v}.r && ${v}.g == ${v}.g && ${v}.b == ${v}.b)) ${v} = vec3(0.0);`;
+THREE.ShaderChunk.opaque_fragment = THREE.ShaderChunk.opaque_fragment.replace("gl_FragColor = vec4( outgoingLight", HDR_SAFE("outgoingLight") + "\ngl_FragColor = vec4( outgoingLight");
+function hdrGuardPass(mat, line) {
+  if (!mat.fragmentShader.includes(line)) return;
+  // вход bloom ограничен сильнее: одиночный пересвеченный пиксель иначе размывается в квадрат свечения
+  mat.fragmentShader = mat.fragmentShader.replace(line, line + "\n" + HDR_SAFE("texel.rgb", "64.0"));
+  mat.needsUpdate = true;
+}
 var GUN_Y = 1.42;
 var RANGE = { back: -4.2, end: 102, halfW: 6, ceil: 3.6, line: 0.62 };
 var LUX = 1 / 200;
@@ -262,6 +275,7 @@ function createScene(canvasHost) {
         float h = clamp(vW.y / ${RANGE.ceil.toFixed(1)}, 0., 1.);
         float d = 0.55 + 0.9 * n3(vW * 1.7 + vec3(0., uTime * 0.03, 0.));
         vec3 c = uCol * d * (0.35 + 0.65 * h);
+        ${HDR_SAFE("c")}
         gl_FragColor = vec4(c, 1.);
         #include <tonemapping_fragment>
         #include <colorspace_fragment>
@@ -328,7 +342,10 @@ function createScene(canvasHost) {
   composer.addPass(gtao);
   const bloom = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.25, 0.45, 1.2);
   composer.addPass(bloom);
-  composer.addPass(new OutputPass());
+  hdrGuardPass(bloom.materialHighPassFilter, "vec4 texel = texture2D( tDiffuse, vUv );");
+  const outPass = new OutputPass();
+  outPass.material.fragmentShader = outPass.material.fragmentShader.replace("gl_FragColor = texture2D( tDiffuse, vUv );", "vec4 texel = texture2D( tDiffuse, vUv );\n" + HDR_SAFE1("texel.rgb") + "\ngl_FragColor = texel;");
+  composer.addPass(outPass);
   const post = { composer, gtao, bloom };
   // Уровни качества. «Высокое» — исходная картинка: AO в полном разрешении, 16 сэмплов, MSAA 4×,
   // тени 4096/2048. Ниже — те же эффекты дешевле: AO в половинном разрешении с меньшим числом

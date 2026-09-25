@@ -269,6 +269,8 @@ void main() {
   vec3 co = ro - A;
   float dv = dot(rd, V), cv = dot(co, V);
   float a = dv * dv - c2, b = 2.0 * (dv * cv - c2 * dot(rd, co)), c = cv * cv - c2 * dot(co, co);
+  // луч вдоль образующей конуса: a → 0, деление дало бы Inf/NaN
+  if (abs(a) < 1e-6) a = a < 0.0 ? -1e-6 : 1e-6;
   float disc = max(b * b - 4.0 * a * c, 0.0), sq = sqrt(disc);
   float t1 = (-b - sq) / (2.0 * a), t2 = (-b + sq) / (2.0 * a);
   if (t1 > t2) { float t = t1; t1 = t2; t2 = t; }
@@ -288,6 +290,7 @@ void main() {
     acc += spotAt(p, 0.72) * dens;
   }
   acc *= dt;
+  ${HDR_SAFE("acc")}
   gl_FragColor = vec4(acc, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
@@ -312,7 +315,9 @@ varying vec3 vL;
 void main() {
   float d = length(gl_PointCoord - 0.5);
   float a = smoothstep(0.5, 0.1, d);
-  gl_FragColor = vec4(vL * a, 1.0);
+  vec3 c = vL * a;
+  ${HDR_SAFE("c")}
+  gl_FragColor = vec4(c, 1.0);
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
 }`;
@@ -353,7 +358,9 @@ varying vec3 vL;
 #include <fog_pars_fragment>
 void main() {
   vec4 t = texture2D(map, vUv);
-  gl_FragColor = vec4(vC * t.rgb * vL, t.a * vA);
+  vec3 c = vC * t.rgb * vL;
+  ${HDR_SAFE("c")}
+  gl_FragColor = vec4(c, t.a * vA);
   if (gl_FragColor.a < 0.003) discard;
   #include <tonemapping_fragment>
   #include <colorspace_fragment>
@@ -504,6 +511,7 @@ void main() {
   float across = exp(-a * a * 5.0);
   float along = pow(vUv.x, 1.6);
   vec3 c = mix(vCol, vec3(1.0), vCore * exp(-a * a * 30.0) * along);
+  ${HDR_SAFE("c")}
   gl_FragColor = vec4(c, vAl * across * along);
   if (gl_FragColor.a < 0.002) discard;
 }`;
