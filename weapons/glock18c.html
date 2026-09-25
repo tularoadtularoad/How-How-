@@ -3893,7 +3893,7 @@ var Particles = class {
   add(p) {
     if (this.list.length >= this.max) this.pool.push(this.list.shift());
     const q = this.pool.pop() || {};
-    Object.assign(q, { t: 0, drag: 2, buoy: 0, gravity: 0, rot: R2() * 6.28, spin: (R2() - 0.5) * 1.2, frame: R2() * 4 | 0, stretch: 0, fadeIn: 0.06, grow: 0, turb: 0 }, p);
+    Object.assign(q, { t: 0, drag: 2, buoy: 0, gravity: 0, rot: R2() * 6.28, spin: (R2() - 0.5) * 1.2, frame: R2() * 4 | 0, stretch: 0, fadeIn: 0.06, grow: 0, turb: 0, bounce: 0 }, p);
     q.px = p.pos.x;
     q.py = p.pos.y;
     q.pz = p.pos.z;
@@ -3926,6 +3926,24 @@ var Particles = class {
       p.py += p.vy * dt;
       p.pz += p.vz * dt;
       p.rot += p.spin * dt;
+      // искры и крошка отскакивают от пола и катятся, теряя скорость
+      if (p.bounce && this.floorAt) {
+        const fl = this.floorAt(p.px, p.pz) + p.size * 0.3;
+        if (p.py < fl) {
+          p.py = fl;
+          if (p.vy < -0.4) {
+            p.vy = -p.vy * p.bounce * (0.7 + R2() * 0.5);
+            p.vx *= 0.55;
+            p.vz *= 0.55;
+            p.spin *= 0.5;
+          } else {
+            p.vy = 0;
+            p.vx *= Math.exp(-6 * dt);
+            p.vz *= Math.exp(-6 * dt);
+            p.spin *= Math.exp(-6 * dt);
+          }
+        }
+      }
     }
     if (this.sort && L.length > 1 && cam) {
       const c = cam.position;
@@ -4213,6 +4231,7 @@ var FX = class {
     this.flashT = 0;
     this.smoke = new Particles(scene, T2.smoke, 420, { atlas: true, sort: true });
     this.fire = new Particles(scene, T2.spark, 260, { additive: true });
+    this.smoke.floorAt = this.fire.floorAt = (x, z) => this.floorAt(x, z);
     this.wind = new THREE6.Vector3(0.18, 0, 0.1);
     this.noWind = new THREE6.Vector3();
     this.heat = 0;
@@ -4379,6 +4398,18 @@ var FX = class {
     for (let i = 0; i < 2; i++) {
       haze(pos.clone().addScaledVector(dir, 0.05 + R2() * 0.2), dir.clone().multiplyScalar(0.15 + R2() * 0.3).add(new THREE6.Vector3(0, 0.04, 0)), { size: 0.05, grow: 0.5 + R2() * 0.3, alpha: 0.045 * lvl, life: 2.2 + R2() * 1.5, drag: 2.5, buoy: 0.07, turb: 0.35, fadeIn: 0.2 });
     }
+    // Дульная волна: газ за пулей срывается вихревым кольцом — оно быстро расширяется поперёк
+    // оси, тормозится воздухом (большое сопротивление) и расплывается. Тормоз режет кольцо вбок.
+    if (!supp && kind !== "brake") {
+      const ringN = 10, up2 = new THREE6.Vector3(0, 1, 0).applyQuaternion(this.flameAxis.quaternion);
+      const ringV = (kind === "bare" ? 3.2 : kind === "comp" ? 2.4 : 1.8) * gas, fwd = (kind === "linear" ? 3 : 1.6) * gas;
+      const d0 = 0.04 + R2() * 0.03;
+      for (let i = 0; i < ringN; i++) {
+        const a = i / ringN * Math.PI * 2 + R2() * 0.3;
+        const rad = side.clone().multiplyScalar(Math.cos(a)).addScaledVector(up2, Math.sin(a));
+        haze(pos.clone().addScaledVector(dir, d0).addScaledVector(rad, 0.01), rad.multiplyScalar(ringV * (0.8 + R2() * 0.4)).addScaledVector(dir, fwd * (0.8 + R2() * 0.4)), { size: 0.016, grow: 0.16 + R2() * 0.08, alpha: 0.075 * lvl, life: 0.7 + R2() * 0.5, drag: 9 + R2() * 3, buoy: 0.05, turb: 0.6, fadeIn: 0.01 });
+      }
+    }
   }
   // пороховые газы из окна выброса
   portSmoke(pos, dir, k = 1) {
@@ -4476,7 +4507,7 @@ var FX = class {
       cnt = Math.max(1, Math.round(cnt * q));
       for (let i = 0; i < cnt; i++) {
         const v = n.clone().multiplyScalar(1 + R2() * spd).add(new THREE6.Vector3((R2() - 0.5) * 4, R2() * 3, (R2() - 0.5) * 4));
-        this.fire.add({ pos: p.clone().addScaledVector(n, 0.01), vel: v.multiplyScalar(0.7 + 0.3 * q), life: 0.15 + R2() * 0.25, size: 0.012 + R2() * 0.01, alpha: 1, color: col, drag: 1.5, gravity: 9.8, stretch: 2, fadeIn: 0, spin: 0 });
+        this.fire.add({ pos: p.clone().addScaledVector(n, 0.01), vel: v.multiplyScalar(0.7 + 0.3 * q), life: 0.25 + R2() * 0.35, size: 0.012 + R2() * 0.01, alpha: 1, color: col, drag: 1.5, gravity: 9.8, stretch: 2, fadeIn: 0, spin: 0, bounce: 0.45 });
       }
     };
     const dust = (cnt, col, size = 0.08, alpha = 0.55) => {
@@ -4489,7 +4520,7 @@ var FX = class {
     const chips = (cnt, col, size = 0.025) => {
       cnt = Math.max(1, Math.round(cnt * q));
       for (let i = 0; i < cnt; i++) {
-        this.smoke.add({ pos: p.clone(), vel: n.clone().multiplyScalar(2 + R2() * 2).add(new THREE6.Vector3((R2() - 0.5) * 2, R2() * 2, (R2() - 0.5) * 2)), life: 0.5 + R2() * 0.3, size, alpha: 0.9, color: col, drag: 0.8, gravity: 9.8, fadeIn: 0 });
+        this.smoke.add({ pos: p.clone(), vel: n.clone().multiplyScalar(2 + R2() * 2).add(new THREE6.Vector3((R2() - 0.5) * 2, R2() * 2, (R2() - 0.5) * 2)), life: 0.9 + R2() * 0.6, size, alpha: 0.9, color: col, drag: 0.8, gravity: 9.8, fadeIn: 0, bounce: 0.3, spin: (R2() - 0.5) * 12 });
       }
     };
     const hole = (scale = 1) => {
@@ -4505,25 +4536,51 @@ var FX = class {
         h.parent?.remove(h);
       }
     };
+    // касательный базис к поверхности попадания
+    const t1 = new THREE6.Vector3().crossVectors(n, Math.abs(n.y) < 0.9 ? new THREE6.Vector3(0, 1, 0) : new THREE6.Vector3(1, 0, 0)).normalize();
+    const t2 = new THREE6.Vector3().crossVectors(n, t1);
+    // пылевая корона: выброс конусом от поверхности + медленно оседающая взвесь
+    const crown = (cnt, col, spd, size) => {
+      cnt = Math.max(2, Math.round(cnt * q));
+      for (let i = 0; i < cnt; i++) {
+        const a = R2() * Math.PI * 2, open = 0.35 + R2() * 0.5;
+        const v = n.clone().multiplyScalar(spd * (0.6 + R2() * 0.6)).addScaledVector(t1, Math.cos(a) * spd * open).addScaledVector(t2, Math.sin(a) * spd * open);
+        this.smoke.add({ pos: p.clone().addScaledVector(n, 0.01), vel: v, life: 0.5 + R2() * 0.5, size: size * 0.5, grow: size * 4, alpha: 0.5, color: col, drag: 7, gravity: 1.2, turb: 0.4, fadeIn: 0.01 });
+      }
+      for (let i = 0; i < Math.max(1, Math.round(2 * q)); i++) this.smoke.add({ pos: p.clone().addScaledVector(n, 0.05), vel: n.clone().multiplyScalar(0.2).add(new THREE6.Vector3((R2() - 0.5) * 0.2, 0.05, (R2() - 0.5) * 0.2)), life: 3 + R2() * 2, size: size * 1.5, grow: size * 9, alpha: 0.12, color: col, drag: 1.5, gravity: 0.05, buoy: 0.01, turb: 0.15, fadeIn: 0.3 });
+    };
     if (surface === "steel") {
       for (let i = 0; i < 3; i++) this.smokePuff(p.clone().addScaledVector(n, 0.02), n.clone().multiplyScalar(0.4).add(new THREE6.Vector3((R2() - 0.5) * 0.6, R2() * 0.5, (R2() - 0.5) * 0.6)), { life: 0.7, size: 0.06, grow: 0.25, alpha: 0.4, drag: 3 });
       sparks(10, 2);
+      // вспышка удара и «брызги» свинца: пуля растекается по плите — веер почти вдоль поверхности
+      this.fire.add({ pos: p.clone().addScaledVector(n, 0.015), vel: new THREE6.Vector3(), life: 0.05, size: 0.07 * (0.7 + 0.3 * q), alpha: 1, color: [1, 0.85, 0.6], drag: 0, fadeIn: 0, spin: 0 });
+      const splash = Math.round(14 * q);
+      for (let i = 0; i < splash; i++) {
+        const a = R2() * Math.PI * 2, s = 6 + R2() * 10;
+        const v = t1.clone().multiplyScalar(Math.cos(a) * s).addScaledVector(t2, Math.sin(a) * s).addScaledVector(n, s * (0.05 + R2() * 0.15));
+        this.fire.add({ pos: p.clone().addScaledVector(n, 0.008), vel: v, life: 0.06 + R2() * 0.1, size: 5e-3 + R2() * 5e-3, alpha: 0.9, color: [1, 0.8, 0.55], drag: 4, gravity: 9.8, stretch: 4, fadeIn: 0, spin: 0 });
+        if (i % 3 === 0) this.smoke.add({ pos: p.clone().addScaledVector(n, 0.01), vel: v.clone().multiplyScalar(0.12), life: 0.5 + R2() * 0.4, size: 0.015, grow: 0.12, alpha: 0.3, color: [0.55, 0.55, 0.56], drag: 5, gravity: 0.2, turb: 0.3 });
+      }
       hole();
     } else if (surface === "paper") {
       hole(0.55);
       chips(4, [0.72, 0.6, 0.42], 0.012);
+      // волокна картона: лёгкое облачко с обеих сторон (пуля прошла насквозь)
+      for (const sgn of [1, -1]) this.smoke.add({ pos: p.clone().addScaledVector(n, 0.01 * sgn), vel: n.clone().multiplyScalar(sgn * (0.3 + R2() * 0.3)), life: 0.5 + R2() * 0.3, size: 0.01, grow: 0.08, alpha: 0.35, color: [0.75, 0.66, 0.5], drag: 4, gravity: 0.3, turb: 0.2 });
     } else if (surface === "trap") {
       sparks(6, 1.5, [1, 0.7, 0.35]);
       dust(3, [0.3, 0.29, 0.27], 0.1, 0.4);
     } else if (surface === "wood") {
       dust(3, [0.55, 0.45, 0.33], 0.05, 0.45);
       chips(6, [0.6, 0.48, 0.32], 0.02);
+      crown(4, [0.58, 0.48, 0.36], 1.4, 0.03);
     } else if (surface === "panel") {
       sparks(2, 1);
       dust(3, [0.35, 0.35, 0.36], 0.06, 0.4);
     } else {
       dust(6, [0.62, 0.61, 0.58]);
       chips(5, [0.45, 0.44, 0.42]);
+      crown(8, [0.6, 0.59, 0.56], 2.2, 0.04);
     }
   }
   // ЛЦУ. s: { pos, dir, hitables, color, k — мощность 0..1 (батарея), night }; i — номер излучателя.
@@ -4905,7 +4962,11 @@ var Ballistics = class {
           // рикошет от грунта под скользящим углом (< ≈7°): пуля теряет большую часть скорости
           const graze = surf !== "steel" && cosI < 0.12 && vl > 180 && b.ricochets < 1 && Math.random() < 0.65;
           b.onHit?.(hit, b, vl, graze);
-          if (graze) {
+          // бумагу/картон пуля пробивает почти без потери скорости и летит дальше, до вала
+          if (surf === "paper" && (b.pierced = (b.pierced || 0) + 1) < 4) {
+            b.v.multiplyScalar(0.985);
+            b.p.addScaledVector(b.v, 4e-3 / vl);
+          } else if (graze) {
             b.ricochets++;
             b.v.addScaledVector(n, -2 * b.v.dot(n)).multiplyScalar(0.45 + Math.random() * 0.15);
             b.v.x += (Math.random() - 0.5) * 0.12 * vl;

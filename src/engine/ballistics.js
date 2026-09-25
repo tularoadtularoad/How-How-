@@ -198,7 +198,11 @@ var Ballistics = class {
           // рикошет от грунта под скользящим углом (< ≈7°): пуля теряет большую часть скорости
           const graze = surf !== "steel" && cosI < 0.12 && vl > 180 && b.ricochets < 1 && Math.random() < 0.65;
           b.onHit?.(hit, b, vl, graze);
-          if (graze) {
+          // бумагу/картон пуля пробивает почти без потери скорости и летит дальше, до вала
+          if (surf === "paper" && (b.pierced = (b.pierced || 0) + 1) < 4) {
+            b.v.multiplyScalar(0.985);
+            b.p.addScaledVector(b.v, 4e-3 / vl);
+          } else if (graze) {
             b.ricochets++;
             b.v.addScaledVector(n, -2 * b.v.dot(n)).multiplyScalar(0.45 + Math.random() * 0.15);
             b.v.x += (Math.random() - 0.5) * 0.12 * vl;

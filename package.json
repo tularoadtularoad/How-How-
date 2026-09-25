@@ -1,0 +1,12 @@
+{
+  "name": "gunsmith-range",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "bash tests/all.sh"
+  },
+  "devDependencies": {
+    "playwright-core": "^1.55.0"
+  }
+}

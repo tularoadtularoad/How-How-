@@ -1,3 +1,3 @@
 .hoplite/
 node_modules/
-/tmp/
+tests/shots/
