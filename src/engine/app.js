@@ -99,6 +99,7 @@ async function boot(def, lib) {
   const audio = new GunAudio();
   audio.profile = { ...def.audio, rpm: def.base.rpm, family: def.family || (def.id.startsWith("ak") ? "ak" : def.id) };
   const fx = new FX(S.scene, mats);
+  const pip = new PipScope(S.renderer, S.scene);
   const ironRay = new THREE8.Raycaster();
   fx.floorAt = S.range.floorAt;
   const ball = new Ballistics();
@@ -127,6 +128,8 @@ async function boot(def, lib) {
     adsT: 0,
     sightIdx: 0,
     zoom: 1,
+    // кратность «сверх штатной» для прицелов без переменной кратности (колесо в прицеливании)
+    zoomMul: 1,
     light: false,
     laser: false,
     emOn: {},
@@ -167,6 +170,7 @@ async function boot(def, lib) {
     return steel ? "steel" : "poly";
   }
   function applyConfig(next, opts = {}) {
+    pip.release();
     cfg = asm.apply(next);
     const magInfo = asm.info("mag")?.mag;
     const prevCap = st.cap;
@@ -304,11 +308,39 @@ async function boot(def, lib) {
       const apertureR = rearIt ? rearIt.info.irons.hole : base.irons?.hole;
       sights.push({ id: "irons", label: "Механический прицел", eye: rear, dir, mag: 1, irons: true, type, eyeDist, apertureR, rearObj: rearIt?.obj || base.nodes?.rearSight || null, x0: rear.x });
     }
+    if (!sights.length) {
+      const bs = boreSight();
+      if (bs) sights.push(bs);
+    }
     const optNow = sights.find((s) => s.id === "optic")?.label || null;
     const i = sights.findIndex((s) => s.id === prev);
     st.sightIdx = i >= 0 && optNow === lastOptic ? i : 0;
     lastOptic = optNow;
     if (sights[st.sightIdx]?.id === "magnifier" && st.magAside) st.sightIdx = 0;
+  }
+  // Без прицела целятся «по стволу»: глаз над верхом ствольной коробки, линия — параллельно оси
+  // канала. Высота — наименьшая, при которой линия до дульного среза ничего не задевает.
+  function boreSight() {
+    gun.updateMatrixWorld(true);
+    const mx = muzzleX(), ex = base.eyeX ?? -240;
+    const meshes = [];
+    gun.traverseVisible((o) => {
+      if (o.isMesh && !o.userData.lens && !o.userData.reticle && !o.material?.transparent) meshes.push(o);
+    });
+    const a = new THREE8.Vector3(), b = new THREE8.Vector3();
+    for (let h = 14; h <= 140; h += 3) {
+      gun.localToWorld(a.set(ex, h, 0));
+      gun.localToWorld(b.set(mx, h, 0));
+      const d = b.sub(a), len = d.length();
+      ironRay.set(a, d.divideScalar(len));
+      ironRay.near = 0;
+      ironRay.far = len;
+      if (ironRay.intersectObjects(meshes, false).length) continue;
+      // sightPose для механики ставит глаз на 220 мм позади «целика» — ровно в ex
+      const eye = new THREE8.Vector3(ex + 220, h + 4, 0);
+      return { id: "bore", label: "По стволу (без прицела)", eye, dir: new THREE8.Vector3(1, 0, 0), mag: 1, irons: true, type: "notch", bore: true, x0: eye.x };
+    }
+    return null;
   }
   const f = base.focus || { center: [0, 0, 0], size: 900 };
   const controls = new OrbitControls(S.camera, S.renderer.domElement);
@@ -344,7 +376,9 @@ async function boot(def, lib) {
     const back = s.dir.clone().negate();
     out.quat.setFromRotationMatrix(new THREE8.Matrix4().makeBasis(right, up, back));
     const mag = s.zoom ? st.zoom : s.mag;
-    out.fov = s.irons ? baseFov * 0.78 : baseFov / Math.max(1, mag) * (mag > 1 ? 1 : 0.88);
+    // zoomMul меняет только поле зрения: режим (оптика/коллиматор) задаёт штатная кратность
+    const zm = s.zoom ? 1 : st.zoomMul;
+    out.fov = (s.irons ? baseFov * 0.78 : baseFov / Math.max(1, mag) * (mag > 1 ? 1 : 0.88)) / zm;
     out.mag = mag;
     out.s = s;
     return out;
@@ -808,6 +842,7 @@ async function boot(def, lib) {
       return;
     }
     st.sightIdx = (st.sightIdx + 1) % sights.length;
+    st.zoomMul = 1;
     if (sights[st.sightIdx].id === "magnifier" && st.magAside) toggleMagnifier(false);
     ui?.toast("Прицел: " + sights[st.sightIdx].label);
     ui?.hud();
@@ -1283,11 +1318,7 @@ async function boot(def, lib) {
   });
   cvs.addEventListener("wheel", (e) => {
     if (!st.ads) return;
-    const s = sights[st.sightIdx];
-    if (s?.zoom) {
-      st.zoom = clamp(st.zoom * (e.deltaY < 0 ? 1.18 : 1 / 1.18), s.zoom[0], s.zoom[1]);
-      ui?.hud();
-    }
+    zoomStep(e.deltaY < 0 ? 1 : -1);
     e.preventDefault();
   }, { passive: false });
   cvs.addEventListener("click", (e) => {
@@ -1322,7 +1353,31 @@ async function boot(def, lib) {
     st.trigger = false;
     st.burst = 0;
   }
+  // Кратность в прицеливании: у переменной — её диапазон; у постоянной — 0,75…2 от штатной;
+  // у коллиматора, механики и «по стволу» — до 2× (прищур, как ближе к мишени).
+  function zoomRange(s) {
+    if (!s) return [1, 1];
+    if (s.zoom) return s.zoom;
+    return s.mag > 1.2 ? [0.75, 2] : [1, 2];
+  }
+  function zoomStep(dir) {
+    const s = sights[st.sightIdx];
+    if (!s) return;
+    const [lo, hi] = zoomRange(s);
+    const k = dir > 0 ? 1.18 : 1 / 1.18;
+    if (s.zoom) st.zoom = clamp(st.zoom * k, lo, hi);
+    else {
+      st.zoomMul = clamp(st.zoomMul * k, lo, hi);
+      if (Math.abs(st.zoomMul - 1) < 0.05) st.zoomMul = 1;
+    }
+    ui?.hud();
+    app?.invalidate?.();
+  }
   const keys = {
+    Equal: () => zoomStep(1),
+    NumpadAdd: () => zoomStep(1),
+    Minus: () => zoomStep(-1),
+    NumpadSubtract: () => zoomStep(-1),
     KeyR: reload,
     KeyX: cycleMode,
     KeyF: () => setADS(!st.ads),
@@ -1358,7 +1413,7 @@ async function boot(def, lib) {
       e.preventDefault();
       return;
     }
-    if (e.repeat) return;
+    if (e.repeat && !/^(Equal|Minus|NumpadAdd|NumpadSubtract)$/.test(e.code)) return;
     const fn = keys[e.code];
     if (fn) {
       fn(e);
@@ -1769,6 +1824,9 @@ async function boot(def, lib) {
     qLevel = i;
     const q = S.setQuality(i);
     fx.setQuality(q);
+    // картинка в оптике: на «низком» — до 256² и через кадр, пока камера движется
+    pip.maxSize = i === 0 ? 256 : i === 1 ? 384 : 512;
+    pip.every = i === 0 ? 2 : 1;
     maxDpr = Math.min(devicePixelRatio || 1, q.dpr);
     minDpr = Math.max(0.6, maxDpr * 0.6);
     activeDpr = Math.min(Math.max(activeDpr, minDpr), maxDpr);
@@ -1840,6 +1898,7 @@ async function boot(def, lib) {
     for (let i = 0; i < n; i++) update(dt);
     gun.updateMatrixWorld();
     R4.shadowMap.needsUpdate = true;
+    pipFrame();
     S.render();
   };
   app.quality = () => ({ mode: qMode, level: S.quality.id, auto: qAuto, activeDpr, curDpr, maxDpr, shadow: S.sun.shadow.mapSize.x });
@@ -1848,6 +1907,34 @@ async function boot(def, lib) {
     qMode = Q_MODES[(Q_MODES.indexOf(m) + Q_MODES.length - 1) % Q_MODES.length];
     cycleQuality();
   };
+  /* ---------------------------------------------------------- картинка в оптике вне прицеливания */
+  const pipDir = new THREE8.Vector3(), pipUp = new THREE8.Vector3();
+  function pipFrame() {
+    const cur = sights[st.sightIdx];
+    const mags = st.adsT > 0 ? [] : sights.filter((s) => (s.zoom || s.mag > 1.2) && !(s.id === "magnifier" && st.magAside));
+    const s = mags.includes(cur) ? cur : mags[0];
+    const lens = s && (s.id === "magnifier" ? asm.installed.get("magnifier")?.info?.sight?.lens : s.src?.lens);
+    if (!lens) return pip.release();
+    const bs = s.id === "magnifier" ? sights[0] : s;
+    const x0 = bs.src?.x0 ?? 0, x1 = bs.src?.x1 ?? x0 + 60;
+    const pos = gun.localToWorld(bs.eye.clone().addScaledVector(bs.dir, x1 - x0 + 4));
+    pipDir.copy(s.dir).transformDirection(gun.matrixWorld);
+    pipUp.copy(s.up || Y_UP).transformDirection(gun.matrixWorld);
+    const mag = (s.zoom ? st.zoom : s.mag) * (s === cur && !s.zoom ? st.zoomMul : 1);
+    // поле как у круга оптики в прицеливании: 0,84 высоты кадра при baseFov / кратность
+    const fov = 0.84 * baseFov / Math.max(1, mag);
+    const rs = s.id === "magnifier" ? sights[0] : s;
+    const r = retOf(rs), rdef = r && RETICLES[r.id];
+    let retK = 1;
+    if (rdef) {
+      const sfp = s.zoom && !s.withMag ? s.zoom[1] / mag : 1;
+      retK = fov * 60 / (rdef.field * sfp * (rdef.mag ? 1 : rdef.boost || 1));
+      // окуляр на экране мал: сетка в честном масштабе (шеврон ACOG — 1 % линзы) не видна
+      retK = Math.min(retK, 3.2);
+    }
+    pip.render({ lens, gun, pos, dir: pipDir, up: pipUp, fov, retTex: rs.src?.retMesh?.material.map, retK, retMesh: s.id === "magnifier" ? null : rs.src?.retMesh }, S.camera, innerHeight);
+  }
+  app.pip = pip;
   const loop = () => {
     requestAnimationFrame(loop);
     if (window.__pause) return;
@@ -1872,6 +1959,7 @@ async function boot(def, lib) {
     gunPrev.copy(gun.matrixWorld);
     camDirty = false;
     sceneDirty = false;
+    pipFrame();
     S.render();
   };
   loop();

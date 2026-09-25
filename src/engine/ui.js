@@ -308,7 +308,8 @@ var UI = class {
     B.sound.classList.toggle("off", a.audio.muted);
     B.reload.disabled = st.busy;
     const s = a.sights[st.sightIdx];
-    this.adsHint.innerHTML = st.ads && s ? `<b>${esc(s.label)}</b>${s.zoom ? ` · ${st.zoom.toFixed(1)}×` : s.mag > 1 ? ` · ${s.mag}×` : ""}${ri ? ` · <i>${esc(ri.name)}</i>` : ""}<span>ЛКМ — огонь · ПКМ — выйти${multi ? " · V — другой прицел" : ""}${ri && ri.n > 1 ? " · G — сетка" : ""}${ri ? " · Shift+G — цвет" : ""}${s.zoom ? " · колесо — кратность" : ""}</span>` : "";
+    const zm = s && !s.zoom ? st.zoomMul : 1, magNow = s ? (s.zoom ? st.zoom : s.mag * zm) : 1;
+    this.adsHint.innerHTML = st.ads && s ? `<b>${esc(s.label)}</b>${s.zoom || s.mag > 1 || zm !== 1 ? ` · ${magNow.toFixed(magNow % 1 ? 1 : 0)}×` : ""}${ri ? ` · <i>${esc(ri.name)}</i>` : ""}<span>ЛКМ — огонь · ПКМ — выйти${multi ? " · V — другой прицел" : ""}${ri && ri.n > 1 ? " · G — сетка" : ""}${ri ? " · Shift+G — цвет" : ""} · колесо, +/− — ${s.zoom || s.mag > 1.2 ? "кратность" : "приближение"}</span>` : "";
     this.adsHint.classList.toggle("on", !!(st.ads && s));
     this.root.classList.toggle("ads", st.ads);
     if (this.lastStats !== st.stats) {

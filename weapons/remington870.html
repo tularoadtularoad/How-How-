@@ -5530,7 +5530,8 @@ var UI = class {
     B.sound.classList.toggle("off", a.audio.muted);
     B.reload.disabled = st.busy;
     const s = a.sights[st.sightIdx];
-    this.adsHint.innerHTML = st.ads && s ? `<b>${esc(s.label)}</b>${s.zoom ? ` · ${st.zoom.toFixed(1)}×` : s.mag > 1 ? ` · ${s.mag}×` : ""}${ri ? ` · <i>${esc(ri.name)}</i>` : ""}<span>ЛКМ — огонь · ПКМ — выйти${multi ? " · V — другой прицел" : ""}${ri && ri.n > 1 ? " · G — сетка" : ""}${ri ? " · Shift+G — цвет" : ""}${s.zoom ? " · колесо — кратность" : ""}</span>` : "";
+    const zm = s && !s.zoom ? st.zoomMul : 1, magNow = s ? (s.zoom ? st.zoom : s.mag * zm) : 1;
+    this.adsHint.innerHTML = st.ads && s ? `<b>${esc(s.label)}</b>${s.zoom || s.mag > 1 || zm !== 1 ? ` · ${magNow.toFixed(magNow % 1 ? 1 : 0)}×` : ""}${ri ? ` · <i>${esc(ri.name)}</i>` : ""}<span>ЛКМ — огонь · ПКМ — выйти${multi ? " · V — другой прицел" : ""}${ri && ri.n > 1 ? " · G — сетка" : ""}${ri ? " · Shift+G — цвет" : ""} · колесо, +/− — ${s.zoom || s.mag > 1.2 ? "кратность" : "приближение"}</span>` : "";
     this.adsHint.classList.toggle("on", !!(st.ads && s));
     this.root.classList.toggle("ads", st.ads);
     if (this.lastStats !== st.stats) {
@@ -5622,6 +5623,164 @@ var UI = class {
     this.tipEl.style.left = x + 14 + "px";
     this.tipEl.style.top = y + 14 + "px";
     this.tipEl.classList.add("on");
+  }
+};
+
+// src/engine/pip.js
+// Картинка в оптике вне прицеливания (picture-in-picture): сцена рендерится с объектива в небольшую
+// текстуру и выводится на окуляр вместе с сеткой. Выходной зрачок: при взгляде сбоку картинку
+// закрывает тень кромки, как у настоящей оптики. Размер текстуры — по размеру окуляра на экране.
+var PIP_VS = `
+varying vec3 vP;
+void main() {
+  vP = position;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}`;
+var PIP_FS = `
+uniform sampler2D uImg, uRet;
+uniform vec2 uC;
+uniform float uR, uRetK, uHasRet, uGain, uLive;
+uniform vec3 uCamL, uTint;
+varying vec3 vP;
+void main() {
+  // координаты на окуляре: x — вправо (+z объекта), y — вверх; ±1 — кромка линзы
+  vec2 q = vec2(vP.z - uC.y, vP.y - uC.x) / uR;
+  float r = length(q);
+  vec3 v = normalize(vP - uCamL);
+  vec2 off = vec2(v.z, v.y) / max(v.x, 0.25);
+  vec3 col = texture2D(uImg, 0.5 + 0.5 * q).rgb * uGain;
+  if (uHasRet > 0.5) {
+    vec2 ru = 0.5 + 0.5 * q * uRetK;
+    if (ru.x > 0.0 && ru.x < 1.0 && ru.y > 0.0 && ru.y < 1.0) {
+      vec4 rt = texture2D(uRet, ru);
+      col = mix(col, rt.rgb * 1.6, rt.a);
+    }
+  }
+  float pupil = length(q + off * 0.55);
+  float vig = (1.0 - smoothstep(0.72, 1.02, pupil)) * (1.0 - smoothstep(0.93, 1.0, r));
+  col *= mix(0.0, vig, uLive);
+  // просветление: слабый цветной отблеск к краю стекла
+  col += uTint * (0.015 + 0.05 * smoothstep(0.35, 1.0, r));
+  ${HDR_SAFE("col")}
+  gl_FragColor = vec4(col, 1.0);
+}`;
+var PipScope = class {
+  constructor(renderer, scene) {
+    this.R = renderer;
+    this.scene = scene;
+    this.cam = new THREE.PerspectiveCamera(8, 1, 0.02, 400);
+    this.rt = null;
+    this.size = 0;
+    this.lens = null;
+    this.frame = 0;
+    this.every = 1;
+    this.maxSize = 512;
+    this._v = new THREE.Vector3();
+    this._c = new THREE.Vector3();
+    this._m = new THREE.Matrix4();
+  }
+  target(px) {
+    // шаги по степеням двойки с запасом ×1,6 к размеру окуляра: без мерцания при уменьшении
+    let n = 128;
+    while (n < px * 1.6 && n < this.maxSize) n *= 2;
+    if (n === this.size && this.rt) return this.rt;
+    this.rt?.dispose();
+    this.size = n;
+    this.rt = new THREE.WebGLRenderTarget(n, n, { type: THREE.HalfFloatType, generateMipmaps: true, minFilter: THREE.LinearMipmapLinearFilter, magFilter: THREE.LinearFilter, samples: 0 });
+    if (this.lens) this.lens.userData.pipMat.uniforms.uImg.value = this.rt.texture;
+    return this.rt;
+  }
+  material(lens) {
+    if (lens.userData.pipMat) return lens.userData.pipMat;
+    const g = lens.geometry;
+    g.computeBoundingBox();
+    const b = g.boundingBox;
+    const glass = lens.material;
+    const m = new THREE.ShaderMaterial({
+      uniforms: {
+        uImg: { value: null },
+        uRet: { value: null },
+        uC: { value: new THREE.Vector2((b.min.y + b.max.y) / 2, (b.min.z + b.max.z) / 2) },
+        uR: { value: Math.max(b.max.y - b.min.y, b.max.z - b.min.z) / 2 },
+        uRetK: { value: 1 },
+        uHasRet: { value: 0 },
+        uGain: { value: 0.9 },
+        uLive: { value: 0 },
+        uCamL: { value: new THREE.Vector3() },
+        uTint: { value: (glass.color || new THREE.Color(0.3, 0.4, 0.6)).clone().multiplyScalar(0.5) }
+      },
+      vertexShader: PIP_VS,
+      fragmentShader: PIP_FS
+    });
+    for (const k of ["stencilWrite", "stencilRef", "stencilFunc", "stencilZPass"]) m[k] = glass[k];
+    lens.userData.pipMat = m;
+    lens.userData.glassMat = glass;
+    return m;
+  }
+  // вернуть стекло: прицеливание, модуль снят, картинка не нужна
+  release() {
+    const l = this.lens;
+    if (!l) return;
+    if (l.userData.glassMat) l.material = l.userData.glassMat;
+    if (this.hidRet) this.hidRet.visible = true;
+    this.lens = null;
+    this.hidRet = null;
+  }
+  // o: { lens, gun, pos, dir, up, fov, retTex, retK, retMesh, main }
+  render(o, camera, H) {
+    const { lens } = o;
+    if (this.lens !== lens) {
+      this.release();
+      this.lens = lens;
+      lens.material = this.material(lens);
+      lens.material.uniforms.uImg.value = this.rt?.texture ?? null;
+      lens.material.uniforms.uLive.value = 0;
+    }
+    if (o.retMesh && o.retMesh.visible) {
+      o.retMesh.visible = false;
+      this.hidRet = o.retMesh;
+    }
+    const u = lens.material.uniforms;
+    u.uRet.value = o.retTex || null;
+    u.uHasRet.value = o.retTex ? 1 : 0;
+    u.uRetK.value = o.retK || 1;
+    lens.updateWorldMatrix(true, false);
+    u.uCamL.value.copy(camera.position).applyMatrix4(this._m.copy(lens.matrixWorld).invert());
+    // окуляр на экране: размер в пикселях и видимость; сзади камеры или спереди прицела — не рисуем
+    const c = this._c.set(0, u.uC.value.x, u.uC.value.y).applyMatrix4(lens.matrixWorld);
+    const toLens = this._v.copy(c).sub(camera.position);
+    const dist = toLens.length();
+    if (toLens.dot(o.dir) <= 0) return false;
+    const rWorld = u.uR.value * lens.matrixWorld.getMaxScaleOnAxis();
+    const px = rWorld / Math.max(1e-4, dist) / Math.tan(camera.fov * Math.PI / 360) * H;
+    const ndc = c.clone().project(camera);
+    if (ndc.z > 1 || Math.abs(ndc.x) > 1.2 || Math.abs(ndc.y) > 1.2 || px < 5) return false;
+    if (u.uLive.value && this.frame++ % this.every) return false;
+    const rt = this.target(px);
+    u.uImg.value = rt.texture;
+    const cam = this.cam;
+    cam.fov = o.fov;
+    cam.updateProjectionMatrix();
+    cam.position.copy(o.pos);
+    cam.up.copy(o.up);
+    cam.lookAt(this._v.copy(o.pos).add(o.dir));
+    cam.updateMatrixWorld();
+    // оружие в кадр объектива не попадает (ось прицела выше ствола), а его сотни мешей — самое дорогое
+    const vis = o.gun.visible;
+    o.gun.visible = false;
+    const prev = this.R.getRenderTarget();
+    this.R.setRenderTarget(rt);
+    this.R.render(this.scene, cam);
+    this.R.setRenderTarget(prev);
+    o.gun.visible = vis;
+    u.uLive.value = 1;
+    return true;
+  }
+  dispose() {
+    this.release();
+    this.rt?.dispose();
+    this.rt = null;
+    this.size = 0;
   }
 };
 
@@ -5726,6 +5885,7 @@ async function boot(def, lib) {
   const audio = new GunAudio();
   audio.profile = { ...def.audio, rpm: def.base.rpm, family: def.family || (def.id.startsWith("ak") ? "ak" : def.id) };
   const fx = new FX(S.scene, mats);
+  const pip = new PipScope(S.renderer, S.scene);
   const ironRay = new THREE8.Raycaster();
   fx.floorAt = S.range.floorAt;
   const ball = new Ballistics();
@@ -5754,6 +5914,8 @@ async function boot(def, lib) {
     adsT: 0,
     sightIdx: 0,
     zoom: 1,
+    // кратность «сверх штатной» для прицелов без переменной кратности (колесо в прицеливании)
+    zoomMul: 1,
     light: false,
     laser: false,
     emOn: {},
@@ -5794,6 +5956,7 @@ async function boot(def, lib) {
     return steel ? "steel" : "poly";
   }
   function applyConfig(next, opts = {}) {
+    pip.release();
     cfg = asm.apply(next);
     const magInfo = asm.info("mag")?.mag;
     const prevCap = st.cap;
@@ -5931,11 +6094,39 @@ async function boot(def, lib) {
       const apertureR = rearIt ? rearIt.info.irons.hole : base.irons?.hole;
       sights.push({ id: "irons", label: "Механический прицел", eye: rear, dir, mag: 1, irons: true, type, eyeDist, apertureR, rearObj: rearIt?.obj || base.nodes?.rearSight || null, x0: rear.x });
     }
+    if (!sights.length) {
+      const bs = boreSight();
+      if (bs) sights.push(bs);
+    }
     const optNow = sights.find((s) => s.id === "optic")?.label || null;
     const i = sights.findIndex((s) => s.id === prev);
     st.sightIdx = i >= 0 && optNow === lastOptic ? i : 0;
     lastOptic = optNow;
     if (sights[st.sightIdx]?.id === "magnifier" && st.magAside) st.sightIdx = 0;
+  }
+  // Без прицела целятся «по стволу»: глаз над верхом ствольной коробки, линия — параллельно оси
+  // канала. Высота — наименьшая, при которой линия до дульного среза ничего не задевает.
+  function boreSight() {
+    gun.updateMatrixWorld(true);
+    const mx = muzzleX(), ex = base.eyeX ?? -240;
+    const meshes = [];
+    gun.traverseVisible((o) => {
+      if (o.isMesh && !o.userData.lens && !o.userData.reticle && !o.material?.transparent) meshes.push(o);
+    });
+    const a = new THREE8.Vector3(), b = new THREE8.Vector3();
+    for (let h = 14; h <= 140; h += 3) {
+      gun.localToWorld(a.set(ex, h, 0));
+      gun.localToWorld(b.set(mx, h, 0));
+      const d = b.sub(a), len = d.length();
+      ironRay.set(a, d.divideScalar(len));
+      ironRay.near = 0;
+      ironRay.far = len;
+      if (ironRay.intersectObjects(meshes, false).length) continue;
+      // sightPose для механики ставит глаз на 220 мм позади «целика» — ровно в ex
+      const eye = new THREE8.Vector3(ex + 220, h + 4, 0);
+      return { id: "bore", label: "По стволу (без прицела)", eye, dir: new THREE8.Vector3(1, 0, 0), mag: 1, irons: true, type: "notch", bore: true, x0: eye.x };
+    }
+    return null;
   }
   const f = base.focus || { center: [0, 0, 0], size: 900 };
   const controls = new OrbitControls(S.camera, S.renderer.domElement);
@@ -5971,7 +6162,9 @@ async function boot(def, lib) {
     const back = s.dir.clone().negate();
     out.quat.setFromRotationMatrix(new THREE8.Matrix4().makeBasis(right, up, back));
     const mag = s.zoom ? st.zoom : s.mag;
-    out.fov = s.irons ? baseFov * 0.78 : baseFov / Math.max(1, mag) * (mag > 1 ? 1 : 0.88);
+    // zoomMul меняет только поле зрения: режим (оптика/коллиматор) задаёт штатная кратность
+    const zm = s.zoom ? 1 : st.zoomMul;
+    out.fov = (s.irons ? baseFov * 0.78 : baseFov / Math.max(1, mag) * (mag > 1 ? 1 : 0.88)) / zm;
     out.mag = mag;
     out.s = s;
     return out;
@@ -6435,6 +6628,7 @@ async function boot(def, lib) {
       return;
     }
     st.sightIdx = (st.sightIdx + 1) % sights.length;
+    st.zoomMul = 1;
     if (sights[st.sightIdx].id === "magnifier" && st.magAside) toggleMagnifier(false);
     ui?.toast("Прицел: " + sights[st.sightIdx].label);
     ui?.hud();
@@ -6910,11 +7104,7 @@ async function boot(def, lib) {
   });
   cvs.addEventListener("wheel", (e) => {
     if (!st.ads) return;
-    const s = sights[st.sightIdx];
-    if (s?.zoom) {
-      st.zoom = clamp(st.zoom * (e.deltaY < 0 ? 1.18 : 1 / 1.18), s.zoom[0], s.zoom[1]);
-      ui?.hud();
-    }
+    zoomStep(e.deltaY < 0 ? 1 : -1);
     e.preventDefault();
   }, { passive: false });
   cvs.addEventListener("click", (e) => {
@@ -6949,7 +7139,31 @@ async function boot(def, lib) {
     st.trigger = false;
     st.burst = 0;
   }
+  // Кратность в прицеливании: у переменной — её диапазон; у постоянной — 0,75…2 от штатной;
+  // у коллиматора, механики и «по стволу» — до 2× (прищур, как ближе к мишени).
+  function zoomRange(s) {
+    if (!s) return [1, 1];
+    if (s.zoom) return s.zoom;
+    return s.mag > 1.2 ? [0.75, 2] : [1, 2];
+  }
+  function zoomStep(dir) {
+    const s = sights[st.sightIdx];
+    if (!s) return;
+    const [lo, hi] = zoomRange(s);
+    const k = dir > 0 ? 1.18 : 1 / 1.18;
+    if (s.zoom) st.zoom = clamp(st.zoom * k, lo, hi);
+    else {
+      st.zoomMul = clamp(st.zoomMul * k, lo, hi);
+      if (Math.abs(st.zoomMul - 1) < 0.05) st.zoomMul = 1;
+    }
+    ui?.hud();
+    app?.invalidate?.();
+  }
   const keys = {
+    Equal: () => zoomStep(1),
+    NumpadAdd: () => zoomStep(1),
+    Minus: () => zoomStep(-1),
+    NumpadSubtract: () => zoomStep(-1),
     KeyR: reload,
     KeyX: cycleMode,
     KeyF: () => setADS(!st.ads),
@@ -6985,7 +7199,7 @@ async function boot(def, lib) {
       e.preventDefault();
       return;
     }
-    if (e.repeat) return;
+    if (e.repeat && !/^(Equal|Minus|NumpadAdd|NumpadSubtract)$/.test(e.code)) return;
     const fn = keys[e.code];
     if (fn) {
       fn(e);
@@ -7396,6 +7610,9 @@ async function boot(def, lib) {
     qLevel = i;
     const q = S.setQuality(i);
     fx.setQuality(q);
+    // картинка в оптике: на «низком» — до 256² и через кадр, пока камера движется
+    pip.maxSize = i === 0 ? 256 : i === 1 ? 384 : 512;
+    pip.every = i === 0 ? 2 : 1;
     maxDpr = Math.min(devicePixelRatio || 1, q.dpr);
     minDpr = Math.max(0.6, maxDpr * 0.6);
     activeDpr = Math.min(Math.max(activeDpr, minDpr), maxDpr);
@@ -7467,6 +7684,7 @@ async function boot(def, lib) {
     for (let i = 0; i < n; i++) update(dt);
     gun.updateMatrixWorld();
     R4.shadowMap.needsUpdate = true;
+    pipFrame();
     S.render();
   };
   app.quality = () => ({ mode: qMode, level: S.quality.id, auto: qAuto, activeDpr, curDpr, maxDpr, shadow: S.sun.shadow.mapSize.x });
@@ -7475,6 +7693,34 @@ async function boot(def, lib) {
     qMode = Q_MODES[(Q_MODES.indexOf(m) + Q_MODES.length - 1) % Q_MODES.length];
     cycleQuality();
   };
+  /* ---------------------------------------------------------- картинка в оптике вне прицеливания */
+  const pipDir = new THREE8.Vector3(), pipUp = new THREE8.Vector3();
+  function pipFrame() {
+    const cur = sights[st.sightIdx];
+    const mags = st.adsT > 0 ? [] : sights.filter((s) => (s.zoom || s.mag > 1.2) && !(s.id === "magnifier" && st.magAside));
+    const s = mags.includes(cur) ? cur : mags[0];
+    const lens = s && (s.id === "magnifier" ? asm.installed.get("magnifier")?.info?.sight?.lens : s.src?.lens);
+    if (!lens) return pip.release();
+    const bs = s.id === "magnifier" ? sights[0] : s;
+    const x0 = bs.src?.x0 ?? 0, x1 = bs.src?.x1 ?? x0 + 60;
+    const pos = gun.localToWorld(bs.eye.clone().addScaledVector(bs.dir, x1 - x0 + 4));
+    pipDir.copy(s.dir).transformDirection(gun.matrixWorld);
+    pipUp.copy(s.up || Y_UP).transformDirection(gun.matrixWorld);
+    const mag = (s.zoom ? st.zoom : s.mag) * (s === cur && !s.zoom ? st.zoomMul : 1);
+    // поле как у круга оптики в прицеливании: 0,84 высоты кадра при baseFov / кратность
+    const fov = 0.84 * baseFov / Math.max(1, mag);
+    const rs = s.id === "magnifier" ? sights[0] : s;
+    const r = retOf(rs), rdef = r && RETICLES[r.id];
+    let retK = 1;
+    if (rdef) {
+      const sfp = s.zoom && !s.withMag ? s.zoom[1] / mag : 1;
+      retK = fov * 60 / (rdef.field * sfp * (rdef.mag ? 1 : rdef.boost || 1));
+      // окуляр на экране мал: сетка в честном масштабе (шеврон ACOG — 1 % линзы) не видна
+      retK = Math.min(retK, 3.2);
+    }
+    pip.render({ lens, gun, pos, dir: pipDir, up: pipUp, fov, retTex: rs.src?.retMesh?.material.map, retK, retMesh: s.id === "magnifier" ? null : rs.src?.retMesh }, S.camera, innerHeight);
+  }
+  app.pip = pip;
   const loop = () => {
     requestAnimationFrame(loop);
     if (window.__pause) return;
@@ -7499,6 +7745,7 @@ async function boot(def, lib) {
     gunPrev.copy(gun.matrixWorld);
     camDirty = false;
     sceneDirty = false;
+    pipFrame();
     S.render();
   };
   loop();
