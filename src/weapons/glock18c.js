@@ -315,7 +315,8 @@ var glock18c_default = {
   slots: [
     { id: "slide", label: "Кожух-затвор", group: "Верх", accepts: ["g18slide"], mount: "slide", required: true },
     { id: "barrel", label: "Ствол", group: "Верх", accepts: ["g18barrel"], mount: "barrel", required: true },
-    { id: "muzzle", label: "Дульное устройство", group: "Верх", accepts: ["muzzle"], mount: "muzzle" },
+    // резьба есть только у отдельного ствола: слот виден всегда, выбор глушителя сам ставит этот ствол
+    { id: "muzzle", label: "Дульное устройство", group: "Верх", accepts: ["muzzle"], mount: "muzzle", via: { slot: "barrel", part: "br_thread" } },
     { id: "optic", label: "Коллиматор", group: "Верх", accepts: ["micro"], mount: "mos" },
     { id: "light", label: "Фонарь / ЛЦУ", group: "Рамка", accepts: ["plight"], rails: ["frameRail"], prefer: "front" },
     { id: "mag", label: "Магазин", group: "Рамка", accepts: ["mag"], mount: "magwell" },

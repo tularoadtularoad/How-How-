@@ -1209,6 +1209,12 @@ async function boot(def, lib) {
   function setPart(slotId, partId, pos) {
     const next = { ...cfg, [slotId]: partId ? { id: partId, pos: pos ?? (cfg[slotId]?.id === partId ? cfg[slotId].pos : null) } : null };
     const slotDef = def.slots.find((s) => s.id === slotId);
+    // слот, которому нужен определённый модуль-носитель (резьба на стволе Glock): ставим его сами
+    let via = null;
+    if (partId && slotDef?.via && !asm.mounts.has(slotDef.mount) && cfg[slotDef.via.slot]?.id !== slotDef.via.part) {
+      next[slotDef.via.slot] = { id: slotDef.via.part };
+      via = asm.part(slotDef.via.part)?.name;
+    }
     const newPart = partId && asm.part(partId);
     if (newPart && slotDef?.behind && !asm.railPositions(slotDef, newPart, slotId).some((p) => !p.clash)) {
       const room = asm.roomBehind(slotDef, newPart);
@@ -1223,6 +1229,7 @@ async function boot(def, lib) {
     } else audio.click();
     const lost = def.slots.filter((s) => next[s.id]?.id && !cfg[s.id]).map((s) => asm.part(next[s.id].id)?.name).filter(Boolean);
     if (partId && !cfg[slotId]) ui?.toast("Не помещается: " + (asm.part(partId)?.name || ""));
+    else if (via && cfg[slotId]) ui?.toast("Установлен " + via.charAt(0).toLowerCase() + via.slice(1));
     else if (lost.length && before !== JSON.stringify(cfg)) ui?.toast("Снято: " + lost.join(", "));
     saveCfg();
   }

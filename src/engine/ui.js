@@ -147,7 +147,7 @@ var UI = class {
     for (const slot2 of def.slots) {
       const opts = asm.slotOptions(slot2);
       if (!opts.length) continue;
-      if (!this.slotAvailable(slot2)) {
+      if (!this.slotAvailable(slot2) && !slot2.via) {
         hiddenSlots.push(slot2.label);
         continue;
       }
