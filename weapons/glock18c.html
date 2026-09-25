@@ -380,7 +380,9 @@ function envScene(night) {
   return s;
 }
 function createScene(canvasHost) {
-  const renderer = new THREE.WebGLRenderer({ antialias: true, stencil: true, powerPreference: "high-performance" });
+  // Сглаживание — MSAA в HDR-буфере композитора; MSAA самого холста только тратило память и
+  // пропускную способность на каждом кадре (в него пишет лишь финальный полноэкранный проход).
+  const renderer = new THREE.WebGLRenderer({ antialias: false, stencil: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setSize(innerWidth, innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -535,11 +537,14 @@ function createScene(canvasHost) {
   // тени 4096/2048. Ниже — те же эффекты дешевле: AO в половинном разрешении с меньшим числом
   // сэмплов, реже MSAA, меньше карты теней и пиксельная плотность. Ничего не выключается целиком.
   const QUALITY = [
-    { id: "low", label: "Низкое", dpr: 1, ao: 0.5, aoS: 8, pdS: 6, msaa: 2, sky: 2048, sun: 1024, spot: 1024, steps: 20, motes: 350 },
+    { id: "low", label: "Низкое", dpr: 1, ao: 0.5, aoS: 8, pdS: 6, msaa: 2, sky: 2048, sun: 1024, spot: 1024, steps: 20, motes: 350, bloom: 0.5 },
     { id: "mid", label: "Среднее", dpr: 1.5, ao: 0.5, aoS: 12, pdS: 8, msaa: 4, sky: 4096, sun: 2048, spot: 1024, steps: 28, motes: 600 },
     { id: "high", label: "Высокое", dpr: 2, ao: 1, aoS: 16, pdS: 16, msaa: 4, sky: 4096, sun: 2048, spot: 2048, steps: 40, motes: 900 }
   ];
   let qi = 2;
+  // свечение и так размыто: на «низком» его цепочка мипов начинается с четверти разрешения
+  const bloomSetSize = bloom.setSize.bind(bloom);
+  bloom.setSize = (w, h) => bloomSetSize(Math.max(1, Math.round(w * (QUALITY[qi].bloom ?? 1))), Math.max(1, Math.round(h * (QUALITY[qi].bloom ?? 1))));
   const gtaoSetSize = gtao.setSize.bind(gtao);
   gtao.setSize = (w, h) => gtaoSetSize(Math.max(1, Math.round(w * QUALITY[qi].ao)), Math.max(1, Math.round(h * QUALITY[qi].ao)));
   const shadowSize = (light, n) => {
@@ -3121,16 +3126,41 @@ var GunAudio = class {
     this.dry = c.createGain();
     this.dry.connect(this.master);
     this.verb = c.createConvolver();
+    const B = this.pre || this.buildBuffers();
+    this.pre = null;
+    // свёртке нужна частота контекста — импульс (дешёвый) строится здесь
     this.verb.buffer = this.impulse(2.6);
     this.wet = c.createGain();
     this.wet.gain.value = 0.55;
     this.verb.connect(this.wet).connect(this.master);
-    this.noise = this.noiseBuf(1.5, "white");
-    this.pink = this.noiseBuf(1.5, "pink");
-    this.crackBuf = this.nwave();
-    this.foley = new Foley(c);
+    this.noise = B.noise;
+    this.pink = B.pink;
+    this.crackBuf = B.crack;
+    this.foley = B.foley;
+    this.foley.ctx = c;
     const idle = window.requestIdleCallback || ((f) => setTimeout(f, 200));
     idle(() => this.warm());
+  }
+  buildBuffers() {
+    return { noise: this.noiseBuf(1.5, "white"), pink: this.noiseBuf(1.5, "pink"), crack: this.nwave(), foley: new Foley(this.ctx) };
+  }
+  // Синтез буферов в простое после загрузки, до первого клика: AudioContext нужен только для
+  // воспроизведения, а AudioBuffer создаётся и без него (частота 48 кГц, при другой — ресэмплинг).
+  // Раньше всё это считалось синхронно на первом клике/выстреле — фриз 0,2–0,5 с.
+  prewarm() {
+    if (this.ctx || this.pre || typeof AudioBuffer === "undefined") return;
+    this.ctx = { sampleRate: 48e3, createBuffer: (ch, n, sr) => new AudioBuffer({ numberOfChannels: ch, length: n, sampleRate: sr }) };
+    try {
+      this.pre = this.buildBuffers();
+      this.foley = this.pre.foley;
+      this.warm();
+    } catch (e) {
+      console.warn("audio prewarm", e);
+      this.pre = null;
+      this.foley = null;
+      this.shots = null;
+    }
+    this.ctx = null;
   }
   setMuted(m) {
     this.muted = m;
@@ -7567,6 +7597,45 @@ async function boot(def, lib) {
   }
   if (qs.get("ui") === "0") document.body.classList.add("noui");
   app.setView = setView;
+  // Прогрев шейдеров: вспышка, дым, искры, гильзы, пробоины и следы пуль компилировались в момент
+  // первого выстрела — фриз на секунды на слабой видеокарте. Прогоняем их один кадр под экраном загрузки.
+  function prewarm() {
+    const V = THREE8.Vector3, p = muzzleWorld(new V(), tmp2), d = tmp2.clone();
+    gun.getWorldQuaternion(tq);
+    fx.muzzleFlash(p, d, "brake", 1, tq, {});
+    fx.shell(p.clone(), new V(0, 1, 0), def.cal, tq, false);
+    fx.shell(p.clone(), new V(0, 1, 0), def.cal, tq, true);
+    const tgt = S.range.hitables[0];
+    if (tgt) {
+      tgt.updateWorldMatrix(true, false);
+      const hp = new V().setFromMatrixPosition(tgt.matrixWorld);
+      for (const surf of ["steel", "dirt"]) fx.impact({ point: hp, object: tgt }, surf, { v: 800 });
+    }
+    const fake = { p: p.clone().addScaledVector(d, 30), v: d.clone().multiplyScalar(800), origin: p.clone(), alive: true, tracer: true, spec: bulletNow() };
+    fx.bullets([fake, { ...fake, tracer: false }], "trace", S.camera);
+    const vis = fx.flash.visible;
+    S.render();
+    fx.flash.visible = vis;
+    // всё созданное — убрать
+    fx.flash.visible = false;
+    fx.flashT = 0;
+    fx.flashLight.intensity = 0;
+    fx.heat = fx.haze = 0;
+    fx.smoke.pool.push(...fx.smoke.list.splice(0));
+    fx.fire.pool.push(...fx.fire.list.splice(0));
+    fx.smoke.mesh.geometry.instanceCount = fx.fire.mesh.geometry.instanceCount = 0;
+    for (const s of fx.shells) s.alive = false;
+    for (const m of fx.inst.values()) m.count = 0;
+    for (const h of fx.holes.splice(0)) h.parent?.remove(h);
+    fx.bullets([], "off", S.camera);
+  }
+  try {
+    prewarm();
+  } catch (e) {
+    console.warn("prewarm", e);
+  }
+  if (window.requestIdleCallback) requestIdleCallback(() => audio.prewarm?.(), { timeout: 4e3 });
+  else setTimeout(() => audio.prewarm?.(), 1500);
   const bootEl = document.getElementById("boot");
   if (bootEl) bootEl.classList.add("off");
   window.__app = app;
@@ -7595,7 +7664,10 @@ async function boot(def, lib) {
       if (/swiftshader|llvmpipe|softpipe|basic render|software/.test(r)) return 0;
       if (/android|iphone|ipad|mobile/i.test(navigator.userAgent)) return 0;
       if ((navigator.deviceMemory || 8) <= 2 || (navigator.hardwareConcurrency || 8) <= 2) return 0;
-      if (/intel|uhd|hd graphics|iris|mali|adreno|powervr|radeon\(tm\) graphics|vega \d+ graphics/.test(r)) return 1;
+      // старая встроенная графика (HD/UHD 5xx–6xx, Vega 3/8) — с «низкого»: дальше уровень сам
+      // поднимется, если кадр стабильно быстрый
+      if (/hd graphics|uhd graphics [56]\d\d|uhd graphics\)|gma|vega [38] graphics|radeon r[2-5]/.test(r)) return 0;
+      if (/intel|uhd|iris|mali|adreno|powervr|radeon\(tm\) graphics|vega \d+ graphics/.test(r)) return 1;
       if ((navigator.deviceMemory || 8) <= 4 || (navigator.hardwareConcurrency || 8) <= 4) return 1;
       return 2;
     } catch (e) {
@@ -7636,7 +7708,9 @@ async function boot(def, lib) {
     applyQuality(qMode === "auto" ? qAuto : Q_INDEX[qMode]);
     ui?.toast("Качество: " + Q_LABEL[qMode] + (qMode === "auto" ? " (" + S.quality.label.toLowerCase() + ")" : ""));
   }
-  let activeDpr = 9, curDpr = R4.getPixelRatio(), fts = [], ftT = 0, slowStreak = 0;
+  let activeDpr = 9, curDpr = R4.getPixelRatio(), fts = [], ftT = 0, slowStreak = 0, adaptN = 0;
+  // потолок авто-подъёма: не выше уровня, с которого уже пришлось спускаться
+  let qCeil = 2;
   applyQuality(qLevel);
   const bootT = performance.now();
   const gunPrev = new THREE8.Matrix4();
@@ -7655,10 +7729,13 @@ async function boot(def, lib) {
     return false;
   }
   function adapt(raw) {
-    if (performance.now() - bootT < 3e3) return;
+    if (performance.now() - bootT < 1500) return;
     if (raw < 0.25) fts.push(raw);
     ftT += raw;
-    if (ftT < 1.5 || fts.length < 10) return;
+    // первые замеры — короче: на слабой машине лаг не должен тянуться секундами
+    const win = adaptN < 3 ? 0.6 : 1.5;
+    if (ftT < win || fts.length < 8) return;
+    adaptN++;
     fts.sort((a, b) => a - b);
     const med = fts[fts.length >> 1];
     fts = [];
@@ -7676,12 +7753,15 @@ async function boot(def, lib) {
       } else fastStreak = 0;
     }
     activeDpr = next;
-    // в режиме «авто»: упёрлись в минимальную плотность — уровень ниже; стабильно быстро — выше
-    if (qMode === "auto" && slowStreak >= 3 && activeDpr <= minDpr + 1e-3 && qLevel > 0) {
+    // в режиме «авто»: сильно медленно (< 25 к/с) — сразу уровень ниже; упёрлись в минимальную
+    // плотность — уровень ниже; стабильно быстро — выше, вплоть до «высокого» (исходная картинка)
+    const verySlow = med > 1 / 25 && adaptN <= 4;
+    if (qMode === "auto" && qLevel > 0 && (verySlow || slowStreak >= 3 && activeDpr <= minDpr + 1e-3)) {
       slowStreak = 0;
       applyQuality(qLevel - 1);
-      activeDpr = maxDpr;
-    } else if (qMode === "auto" && fastStreak >= 6 && activeDpr >= maxDpr - 1e-3 && qLevel < qAuto) {
+      activeDpr = verySlow ? minDpr : maxDpr;
+      qCeil = Math.min(qCeil, qLevel);
+    } else if (qMode === "auto" && fastStreak >= 6 && activeDpr >= maxDpr - 1e-3 && qLevel < qCeil) {
       fastStreak = 0;
       applyQuality(qLevel + 1);
     }

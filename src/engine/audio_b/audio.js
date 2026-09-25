@@ -42,15 +42,41 @@ var GunAudio = class {
     this.dry = c.createGain();
     this.dry.connect(this.master);
     this.verb = c.createConvolver();
+    const B = this.pre || this.buildBuffers();
+    this.pre = null;
+    // свёртке нужна частота контекста — импульс (дешёвый) строится здесь
     this.verb.buffer = this.impulse(2.2);
     this.wet = c.createGain();
     this.wet.gain.value = 0.55;
     this.verb.connect(this.wet).connect(this.master);
-    this.noise = this.noiseBuf(1.5, "white");
-    this.pink = this.noiseBuf(1.5, "pink");
-    this.crackBuf = this.nwave();
+    this.noise = B.noise;
+    this.pink = B.pink;
+    this.crackBuf = B.crack;
+    this.foley = B.foley;
+    this.foley.ctx = c;
     const idle = window.requestIdleCallback || ((f) => setTimeout(f, 200));
     idle(() => this.warm());
+  }
+  buildBuffers() {
+    return { noise: this.noiseBuf(1.5, "white"), pink: this.noiseBuf(1.5, "pink"), crack: this.nwave(), foley: new Foley(this.ctx) };
+  }
+  // Синтез буферов в простое после загрузки, до первого клика: AudioContext нужен только для
+  // воспроизведения, а AudioBuffer создаётся и без него (частота 48 кГц, при другой — ресэмплинг).
+  // Раньше всё это считалось синхронно на первом клике/выстреле — фриз 0,2–0,5 с.
+  prewarm() {
+    if (this.ctx || this.pre || typeof AudioBuffer === "undefined") return;
+    this.ctx = { sampleRate: 48e3, createBuffer: (ch, n, sr) => new AudioBuffer({ numberOfChannels: ch, length: n, sampleRate: sr }) };
+    try {
+      this.pre = this.buildBuffers();
+      this.foley = this.pre.foley;
+      this.warm();
+    } catch (e) {
+      console.warn("audio prewarm", e);
+      this.pre = null;
+      this.foley = null;
+      this.shots = null;
+    }
+    this.ctx = null;
   }
   setMuted(m) {
     this.muted = m;

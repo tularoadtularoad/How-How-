@@ -1781,6 +1781,45 @@ async function boot(def, lib) {
   }
   if (qs.get("ui") === "0") document.body.classList.add("noui");
   app.setView = setView;
+  // Прогрев шейдеров: вспышка, дым, искры, гильзы, пробоины и следы пуль компилировались в момент
+  // первого выстрела — фриз на секунды на слабой видеокарте. Прогоняем их один кадр под экраном загрузки.
+  function prewarm() {
+    const V = THREE8.Vector3, p = muzzleWorld(new V(), tmp2), d = tmp2.clone();
+    gun.getWorldQuaternion(tq);
+    fx.muzzleFlash(p, d, "brake", 1, tq, {});
+    fx.shell(p.clone(), new V(0, 1, 0), def.cal, tq, false);
+    fx.shell(p.clone(), new V(0, 1, 0), def.cal, tq, true);
+    const tgt = S.range.hitables[0];
+    if (tgt) {
+      tgt.updateWorldMatrix(true, false);
+      const hp = new V().setFromMatrixPosition(tgt.matrixWorld);
+      for (const surf of ["steel", "dirt"]) fx.impact({ point: hp, object: tgt }, surf, { v: 800 });
+    }
+    const fake = { p: p.clone().addScaledVector(d, 30), v: d.clone().multiplyScalar(800), origin: p.clone(), alive: true, tracer: true, spec: bulletNow() };
+    fx.bullets([fake, { ...fake, tracer: false }], "trace", S.camera);
+    const vis = fx.flash.visible;
+    S.render();
+    fx.flash.visible = vis;
+    // всё созданное — убрать
+    fx.flash.visible = false;
+    fx.flashT = 0;
+    fx.flashLight.intensity = 0;
+    fx.heat = fx.haze = 0;
+    fx.smoke.pool.push(...fx.smoke.list.splice(0));
+    fx.fire.pool.push(...fx.fire.list.splice(0));
+    fx.smoke.mesh.geometry.instanceCount = fx.fire.mesh.geometry.instanceCount = 0;
+    for (const s of fx.shells) s.alive = false;
+    for (const m of fx.inst.values()) m.count = 0;
+    for (const h of fx.holes.splice(0)) h.parent?.remove(h);
+    fx.bullets([], "off", S.camera);
+  }
+  try {
+    prewarm();
+  } catch (e) {
+    console.warn("prewarm", e);
+  }
+  if (window.requestIdleCallback) requestIdleCallback(() => audio.prewarm?.(), { timeout: 4e3 });
+  else setTimeout(() => audio.prewarm?.(), 1500);
   const bootEl = document.getElementById("boot");
   if (bootEl) bootEl.classList.add("off");
   window.__app = app;
@@ -1809,7 +1848,10 @@ async function boot(def, lib) {
       if (/swiftshader|llvmpipe|softpipe|basic render|software/.test(r)) return 0;
       if (/android|iphone|ipad|mobile/i.test(navigator.userAgent)) return 0;
       if ((navigator.deviceMemory || 8) <= 2 || (navigator.hardwareConcurrency || 8) <= 2) return 0;
-      if (/intel|uhd|hd graphics|iris|mali|adreno|powervr|radeon\(tm\) graphics|vega \d+ graphics/.test(r)) return 1;
+      // старая встроенная графика (HD/UHD 5xx–6xx, Vega 3/8) — с «низкого»: дальше уровень сам
+      // поднимется, если кадр стабильно быстрый
+      if (/hd graphics|uhd graphics [56]\d\d|uhd graphics\)|gma|vega [38] graphics|radeon r[2-5]/.test(r)) return 0;
+      if (/intel|uhd|iris|mali|adreno|powervr|radeon\(tm\) graphics|vega \d+ graphics/.test(r)) return 1;
       if ((navigator.deviceMemory || 8) <= 4 || (navigator.hardwareConcurrency || 8) <= 4) return 1;
       return 2;
     } catch (e) {
@@ -1850,7 +1892,9 @@ async function boot(def, lib) {
     applyQuality(qMode === "auto" ? qAuto : Q_INDEX[qMode]);
     ui?.toast("Качество: " + Q_LABEL[qMode] + (qMode === "auto" ? " (" + S.quality.label.toLowerCase() + ")" : ""));
   }
-  let activeDpr = 9, curDpr = R4.getPixelRatio(), fts = [], ftT = 0, slowStreak = 0;
+  let activeDpr = 9, curDpr = R4.getPixelRatio(), fts = [], ftT = 0, slowStreak = 0, adaptN = 0;
+  // потолок авто-подъёма: не выше уровня, с которого уже пришлось спускаться
+  let qCeil = 2;
   applyQuality(qLevel);
   const bootT = performance.now();
   const gunPrev = new THREE8.Matrix4();
@@ -1869,10 +1913,13 @@ async function boot(def, lib) {
     return false;
   }
   function adapt(raw) {
-    if (performance.now() - bootT < 3e3) return;
+    if (performance.now() - bootT < 1500) return;
     if (raw < 0.25) fts.push(raw);
     ftT += raw;
-    if (ftT < 1.5 || fts.length < 10) return;
+    // первые замеры — короче: на слабой машине лаг не должен тянуться секундами
+    const win = adaptN < 3 ? 0.6 : 1.5;
+    if (ftT < win || fts.length < 8) return;
+    adaptN++;
     fts.sort((a, b) => a - b);
     const med = fts[fts.length >> 1];
     fts = [];
@@ -1890,12 +1937,15 @@ async function boot(def, lib) {
       } else fastStreak = 0;
     }
     activeDpr = next;
-    // в режиме «авто»: упёрлись в минимальную плотность — уровень ниже; стабильно быстро — выше
-    if (qMode === "auto" && slowStreak >= 3 && activeDpr <= minDpr + 1e-3 && qLevel > 0) {
+    // в режиме «авто»: сильно медленно (< 25 к/с) — сразу уровень ниже; упёрлись в минимальную
+    // плотность — уровень ниже; стабильно быстро — выше, вплоть до «высокого» (исходная картинка)
+    const verySlow = med > 1 / 25 && adaptN <= 4;
+    if (qMode === "auto" && qLevel > 0 && (verySlow || slowStreak >= 3 && activeDpr <= minDpr + 1e-3)) {
       slowStreak = 0;
       applyQuality(qLevel - 1);
-      activeDpr = maxDpr;
-    } else if (qMode === "auto" && fastStreak >= 6 && activeDpr >= maxDpr - 1e-3 && qLevel < qAuto) {
+      activeDpr = verySlow ? minDpr : maxDpr;
+      qCeil = Math.min(qCeil, qLevel);
+    } else if (qMode === "auto" && fastStreak >= 6 && activeDpr >= maxDpr - 1e-3 && qLevel < qCeil) {
       fastStreak = 0;
       applyQuality(qLevel + 1);
     }

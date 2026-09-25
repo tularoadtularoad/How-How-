@@ -196,7 +196,9 @@ function envScene(night) {
   return s;
 }
 function createScene(canvasHost) {
-  const renderer = new THREE.WebGLRenderer({ antialias: true, stencil: true, powerPreference: "high-performance" });
+  // Сглаживание — MSAA в HDR-буфере композитора; MSAA самого холста только тратило память и
+  // пропускную способность на каждом кадре (в него пишет лишь финальный полноэкранный проход).
+  const renderer = new THREE.WebGLRenderer({ antialias: false, stencil: true, powerPreference: "high-performance" });
   renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
   renderer.setSize(innerWidth, innerHeight);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
@@ -351,11 +353,14 @@ function createScene(canvasHost) {
   // тени 4096/2048. Ниже — те же эффекты дешевле: AO в половинном разрешении с меньшим числом
   // сэмплов, реже MSAA, меньше карты теней и пиксельная плотность. Ничего не выключается целиком.
   const QUALITY = [
-    { id: "low", label: "Низкое", dpr: 1, ao: 0.5, aoS: 8, pdS: 6, msaa: 2, sky: 2048, sun: 1024, spot: 1024, steps: 20, motes: 350 },
+    { id: "low", label: "Низкое", dpr: 1, ao: 0.5, aoS: 8, pdS: 6, msaa: 2, sky: 2048, sun: 1024, spot: 1024, steps: 20, motes: 350, bloom: 0.5 },
     { id: "mid", label: "Среднее", dpr: 1.5, ao: 0.5, aoS: 12, pdS: 8, msaa: 4, sky: 4096, sun: 2048, spot: 1024, steps: 28, motes: 600 },
     { id: "high", label: "Высокое", dpr: 2, ao: 1, aoS: 16, pdS: 16, msaa: 4, sky: 4096, sun: 2048, spot: 2048, steps: 40, motes: 900 }
   ];
   let qi = 2;
+  // свечение и так размыто: на «низком» его цепочка мипов начинается с четверти разрешения
+  const bloomSetSize = bloom.setSize.bind(bloom);
+  bloom.setSize = (w, h) => bloomSetSize(Math.max(1, Math.round(w * (QUALITY[qi].bloom ?? 1))), Math.max(1, Math.round(h * (QUALITY[qi].bloom ?? 1))));
   const gtaoSetSize = gtao.setSize.bind(gtao);
   gtao.setSize = (w, h) => gtaoSetSize(Math.max(1, Math.round(w * QUALITY[qi].ao)), Math.max(1, Math.round(h * QUALITY[qi].ao)));
   const shadowSize = (light, n) => {
